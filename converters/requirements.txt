@@ -1,0 +1,3 @@
+# converters/convert_open_datasets.py only (Python 3.9+); adr needs nothing beyond the stdlib
+huggingface_hub>=0.20
+pyarrow>=12

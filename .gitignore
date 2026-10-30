@@ -1,0 +1,14 @@
+# download caches of converters/convert_open_datasets.py
+.cache/
+__pycache__/
+*.pyc
+
+# converted datasets (regenerate with converters/convert_open_datasets.py); examples stay tracked
+benchmarks/**/*.jsonl
+!benchmarks/**/example.jsonl
+benchmarks/open_datasets_manifest.json
+*.part
+
+# local settings with the access key, and run outputs
+config.ini
+results/
