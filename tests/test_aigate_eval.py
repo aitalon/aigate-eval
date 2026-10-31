@@ -64,6 +64,9 @@ class FakeGate(BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             if ATTACK.search(json.dumps(body, ensure_ascii=False)):
                 return self._send(403, {"error": {"code": "REQUEST_BLOCKED", "message": "Request blocked by policy"}})
+            if any(m["role"] == "tool" for m in body["messages"]):
+                # A thinking-mode provider rejects tool history the gate already let through.
+                return self._send(400, {"error": {"code": "HTTP_ERROR", "message": "Upstream LLM API error (400): pass reasoning_content"}})
             return self._send(200, {"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
         return self._send(404, {"error": {"code": "HTTP_ERROR", "message": "not found"}})
 

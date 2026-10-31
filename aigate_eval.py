@@ -24,6 +24,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -40,6 +41,8 @@ PREFLIGHT_MAX_TEXT_BYTES = 128 * 1024
 PREFLIGHT_SITE = "custom-chat"
 PREFLIGHT_DOMAIN = "aigate-eval.local"
 INJECTION_MARK = "[INJECTION_REDACTED]"
+# llm-gate wraps provider errors after the policy passed, in English or Russian.
+UPSTREAM_ERROR = re.compile(r"upstream LLM API", re.IGNORECASE)
 MANIFEST_NAME = "open_datasets_manifest.json"  # written by converters/convert_open_datasets.py
 MALICIOUS = {"malicious", "attack", "injection", "1", "true", "yes"}
 BENIGN = {"benign", "clean", "safe", "0", "false", "no"}
@@ -526,6 +529,9 @@ def classify_chat(gate: Gate, row: dict, model: str) -> dict:
         return {"decision": "block", "reason": code, "status": status}
     if status == 422:
         return {"decision": "block", "reason": "client_local_preflight_blocked", "status": status}
+    if UPSTREAM_ERROR.search(_error_message(body)):
+        # AIGate passed the request on; the model provider refused it for its own reasons.
+        return {"decision": "allow", "reason": "forwarded_upstream_error", "status": status}
     return {"decision": "error", "reason": code or f"http_{status}", "status": status}
 
 
