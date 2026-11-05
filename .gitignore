@@ -6,9 +6,14 @@ __pycache__/
 # converted datasets (regenerate with converters/convert_open_datasets.py); examples stay tracked
 benchmarks/**/*.jsonl
 !benchmarks/**/example.jsonl
+!benchmarks/**/core.jsonl
+!benchmarks/**/curated*.jsonl
 benchmarks/open_datasets_manifest.json
 *.part
 
 # local settings with the access key, and run outputs
 config.ini
 results/
+
+# Installation-specific evaluation reports stay private.
+/docs/reports/

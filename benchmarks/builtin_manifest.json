@@ -1,0 +1,74 @@
+{
+  "schema": "aigate-eval-builtin-v1",
+  "version": "2026-11-05",
+  "purpose": "Diagnostic synthetic reference cases, not the independent split of the client benchmark study",
+  "total_rows": 639,
+  "files": [
+    {
+      "file": "injection/core.jsonl",
+      "rows": 260,
+      "sha256": "9812000742fd251e8bc4c5d7e89d26a1c4433c9ec408004da49358fa4921987c",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "injection/example.jsonl",
+      "rows": 5,
+      "sha256": "661c4c5898b646d1934fd9387bd381023e42876e477088cdfd830f948543c092",
+      "origin": "legacy-example"
+    },
+    {
+      "file": "pii/curated_clean.jsonl",
+      "rows": 88,
+      "sha256": "5cb116be57087a51e363d2e9f1eeee75963902e15d8e8da9c9eb650765bc052c",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/curated_contacts.jsonl",
+      "rows": 70,
+      "sha256": "33b722df19a7bfc12a8f922a65f2c0fb9057023900c2fc94642ab9a1794a91ed",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/curated_contextual.jsonl",
+      "rows": 40,
+      "sha256": "893e6a266e86d3e5f15907fa536698d858767fb144805e490af91316cf54a49d",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/curated_extended.jsonl",
+      "rows": 48,
+      "sha256": "e600a5958723b81f085bf40b8c7668ddb4bd93febb095ad991bc9fed26735209",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/curated_financial.jsonl",
+      "rows": 30,
+      "sha256": "874a2a0a11ec163bdb24a83bd3c360f90cda6790a4880f8d6ec0df6c63c85f4d",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/curated_identifiers.jsonl",
+      "rows": 32,
+      "sha256": "d74405586ccb7350f961a9084052e55868a5f6b194c33233a2f617881a32187b",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/curated_mixed.jsonl",
+      "rows": 32,
+      "sha256": "d45911a3d4f19c11f2d6bd3af4555ec9853c0b07affb9ca120eb8eaf84a36c68",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/curated_people.jsonl",
+      "rows": 30,
+      "sha256": "2d4ec8d31542c9a189b798c45ed017acee662f4d1a9ff18c15a24725fce835ae",
+      "origin": "aitalon-authored-synthetic-v1"
+    },
+    {
+      "file": "pii/example.jsonl",
+      "rows": 4,
+      "sha256": "182af0f7c6525a0ca0a30a1b0156d4689e42cb487ab04cd8acafb2856d7a517a",
+      "origin": "legacy-example"
+    }
+  ]
+}

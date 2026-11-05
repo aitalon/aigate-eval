@@ -5,6 +5,7 @@
     python3 aigate_eval.py check      # connection and policy on two samples
     python3 aigate_eval.py pii        # masking of personal data
     python3 aigate_eval.py injection  # prompt-injection detection
+    python3 aigate_eval.py datasets   # validate bundled data offline, no config needed
 
 Settings live in config.ini (copy config.example.ini). Datasets are the
 *.jsonl files of the folders the config names (benchmarks/pii,
@@ -23,6 +24,7 @@ import difflib
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import ssl
@@ -34,15 +36,20 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 PROTECT = 0.5  # share of an entity's letters/digits that must be hidden
 IGNORED_TYPES = ("PII.ORGANIZATION", "NETWORK.HOSTNAME", "ATTACK.")
 PREFLIGHT_MAX_TEXT_BYTES = 128 * 1024
 PREFLIGHT_SITE = "custom-chat"
 PREFLIGHT_DOMAIN = "aigate-eval.local"
 INJECTION_MARK = "[INJECTION_REDACTED]"
+REDACTION_TOKEN = re.compile(
+    r"\[(?:REDACTED(?:_[A-Za-z0-9_-]+)?|"
+    r"[A-Z][A-Z0-9_]*_REDACTED)\]"
+)
 # llm-gate wraps provider errors after the policy passed, in English or Russian.
 UPSTREAM_ERROR = re.compile(r"upstream LLM API", re.IGNORECASE)
+INCOMPLETE_SCAN = re.compile(r"проверка неполна|scan[_ ]incomplete|sensitivecore_unavailable", re.IGNORECASE)
 MANIFEST_NAME = "open_datasets_manifest.json"  # written by converters/convert_open_datasets.py
 MALICIOUS = {"malicious", "attack", "injection", "1", "true", "yes"}
 BENIGN = {"benign", "clean", "safe", "0", "false", "no"}
@@ -136,6 +143,11 @@ class Gate:
             },
         )
         if status == 200 and body.get("decision") in ("allow", "mask", "block"):
+            reason = body.get("reason", "")
+            if reason in {"server_scan_incomplete", "server_mask_invalid", "server_rate_limit_exceeded", "policy_unavailable", "server_preflight_timeout"}:
+                return {"decision": "error", "reason": reason, "status": status}
+            if body["decision"] == "mask" and (not isinstance(body.get("text"), str) or not body["text"] or body["text"] == text):
+                return {"decision": "error", "reason": "invalid_mask_response", "status": status}
             return {
                 "decision": body["decision"],
                 "reason": body.get("reason", ""),
@@ -148,7 +160,7 @@ class Gate:
                 "reason": body.get("reason", "unavailable"),
                 "status": status,
             }
-        if status == 422:  # AIGate client bridge: local preflight blocked the request
+        if status == 422 and _local_block(body):
             return {
                 "decision": "block",
                 "reason": "client_local_preflight_blocked",
@@ -200,10 +212,29 @@ def _error_message(body: dict) -> str:
     return str(body.get("message") or body.get("detail") or "")[:200]
 
 
+def _local_block(body: dict) -> bool:
+    """A validation error (also HTTP 422) is not a detected attack."""
+    error = body.get("error")
+    if isinstance(error, dict) and (error.get("scan_truncated") or INCOMPLETE_SCAN.search(str(error.get("message", "")))):
+        return False
+    return (
+        isinstance(error, dict) and error.get("type") == "local_preflight_error"
+        and bool(error.get("blocked_by")) and not error.get("scan_truncated")
+    ) or (
+        body.get("decision") == "block"
+        or _error_code(body).casefold() in {
+            "client_local_preflight_blocked", "local_preflight_blocked",
+            "request_blocked", "content_guard_blocked", "preflight_blocked",
+        }
+    )
+
+
 # --------------------------------------------------------------------------- data
 
 
 def load_rows(patterns: list[str], limit: int | None) -> list[dict]:
+    if limit is not None and limit <= 0:
+        raise SystemExit("--limit must be a positive integer (per file)")
     files: list[str] = []
     for pattern in patterns:
         for part in pattern.split(","):
@@ -217,7 +248,7 @@ def load_rows(patterns: list[str], limit: int | None) -> list[dict]:
     seen: set[str] = set()
     for path in dict.fromkeys(files):
         taken = 0
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             for number, line in enumerate(handle, 1):
                 line = line.strip()
                 if not line:
@@ -239,6 +270,8 @@ def load_rows(patterns: list[str], limit: int | None) -> list[dict]:
                 row.setdefault("source", Path(path).stem)
                 row["_file"] = Path(path).name
                 rows.append(row)
+    if not rows:
+        raise SystemExit("selected datasets contain no rows")
     return rows
 
 
@@ -268,12 +301,20 @@ def check_entities(row: dict) -> list[dict] | None:
     out = []
     for entity in entities:
         try:
-            start, end = int(entity["start"]), int(entity["end"])
+            if not isinstance(entity, dict):
+                raise TypeError
+            start, end = entity["start"], entity["end"]
+            if type(start) is not int or type(end) is not int:
+                raise TypeError
             kind = str(entity.get("type") or entity.get("label") or "")
         except (KeyError, TypeError, ValueError):
             raise SystemExit(f"row {row['id']}: an entity needs start, end and type") from None
         if not 0 <= start < end <= len(text):
             raise SystemExit(f"row {row['id']}: entity [{start}, {end}) is outside the text")
+        if not kind.strip():
+            raise SystemExit(f"row {row['id']}: an entity needs a nonempty type")
+        if "text" in entity and entity["text"] != text[start:end]:
+            raise SystemExit(f"row {row['id']}: entity text does not match [{start}, {end})")
         out.append({**entity, "start": start, "end": end, "type": kind})
     return out
 
@@ -287,6 +328,16 @@ def row_label(row: dict) -> str:
     raise SystemExit(
         f"row {row['id']}: 'label' must be malicious or benign, got {row.get('label')!r}"
     )
+
+
+def _row_metadata(row: dict) -> dict:
+    return {
+        key: row[key] for key in (
+            "id", "source", "language", "category", "difficulty", "kind",
+            "policy_dependent", "origin", "tags",
+            "provenance", "synthetic",
+        ) if key in row
+    }
 
 
 def run_parallel(rows: list[dict], work, jobs: int, title: str) -> list[dict]:
@@ -320,7 +371,21 @@ def run_parallel(rows: list[dict], work, jobs: int, title: str) -> list[dict]:
 def kept_mask(original: str, masked: str) -> bytearray:
     """1 for every character of the original that survived in the masked text."""
     kept = bytearray(len(original))
-    matcher = difflib.SequenceMatcher(None, original, masked, autojunk=len(original) > 20000)
+    # Generated opaque IDs may share digits with a phone/passport/CVC. They carry
+    # no original value: exclude new AIGate tokens from character alignment.
+    # Source literals and unknown markers remain ordinary text, conservatively.
+    comparison = []
+    source_tokens = {match.group() for match in REDACTION_TOKEN.finditer(original)}
+    cursor = 0
+    for match in REDACTION_TOKEN.finditer(masked):
+        comparison.extend(masked[cursor:match.start()])
+        if match.group() in source_tokens:
+            comparison.extend(match.group())
+        else:
+            comparison.append(object())
+        cursor = match.end()
+    comparison.extend(masked[cursor:])
+    matcher = difflib.SequenceMatcher(None, original, comparison, autojunk=len(original) > 20000)
     for tag, i1, i2, _, _ in matcher.get_opcodes():
         if tag == "equal":
             kept[i1:i2] = b"\1" * (i2 - i1)
@@ -330,6 +395,7 @@ def kept_mask(original: str, masked: str) -> bytearray:
 def score_pii(rows: list[dict], outcomes: list[dict]) -> dict:
     total = collections.Counter()
     by_type = collections.defaultdict(lambda: [0, 0])
+    fully_hidden_by_type = collections.Counter()
     by_source = collections.defaultdict(lambda: collections.Counter())
     decisions = collections.Counter()
     leaks = collections.defaultdict(list)
@@ -339,13 +405,13 @@ def score_pii(rows: list[dict], outcomes: list[dict]) -> dict:
         decisions[decision] += 1
         source = by_source[row["source"]]
         entities = row["_entities"]
-        record = {"id": row["id"], "source": row["source"], **outcome}
+        record = {**_row_metadata(row), **outcome}
         if decision in ("error", "skipped"):
             source["errors"] += 1
             details.append(record)
             continue
         text = row["text"]
-        if decision == "mask" and outcome.get("text"):
+        if decision == "mask" and isinstance(outcome.get("text"), str):
             kept = kept_mask(text, outcome["text"])
         elif decision == "block":
             kept = bytearray(len(text))  # nothing was sent
@@ -373,9 +439,15 @@ def score_pii(rows: list[dict], outcomes: list[dict]) -> dict:
                 total["false_alarm"] += changed
             else:
                 leaked = []
+                fully_hidden_doc = True
                 for entity in scored:
                     idx = [i for i in range(entity["start"], entity["end"]) if text[i].isalnum()]
                     ok = bool(idx) and sum(1 for i in idx if not kept[i]) / len(idx) >= PROTECT
+                    fully_hidden = bool(idx) and all(not kept[i] for i in idx)
+                    fully_hidden_doc = fully_hidden_doc and fully_hidden
+                    fully_hidden_by_type[entity["type"]] += fully_hidden
+                    source["fully_hidden"] += fully_hidden
+                    total["fully_hidden"] += fully_hidden
                     by_type[entity["type"]][0] += ok
                     by_type[entity["type"]][1] += 1
                     source["protected"] += ok
@@ -390,11 +462,13 @@ def score_pii(rows: list[dict], outcomes: list[dict]) -> dict:
                 source["docs_leaked"] += bool(leaked)
                 total["docs"] += 1
                 total["docs_leaked"] += bool(leaked)
+                total["fully_hidden_docs"] += fully_hidden_doc
                 record["leaked_types"] = leaked
         details.append(record)
     return {
         "total": dict(total),
         "by_type": {k: {"protected": v[0], "entities": v[1]} for k, v in by_type.items()},
+        "fully_hidden_by_type": dict(fully_hidden_by_type),
         "by_source": {k: dict(v) for k, v in by_source.items()},
         "decisions": dict(decisions),
         "leak_examples": dict(leaks),
@@ -410,10 +484,12 @@ def pii_report(summary: dict, meta: dict) -> str:
         _meta_lines(meta),
         "",
         "Сущность защищена, если после маскирования не осталось хотя бы половины её букв и цифр.",
+        "Это эвристика сопоставления текста, а не доказательство невозможности восстановления данных.",
         "",
         "| Показатель | Значение |",
         "|---|---:|",
         f"| Защищено сущностей | {_pct(t.get('protected', 0), t.get('entities', 0))} ({t.get('protected', 0)} из {t.get('entities', 0)}) |",
+        f"| Полностью скрыты буквы и цифры сущности | {_pct(t.get('fully_hidden', 0), t.get('entities', 0))} ({t.get('fully_hidden', 0)} из {t.get('entities', 0)}) |",
         f"| Документы без утечки | {_pct(t.get('docs', 0) - t.get('docs_leaked', 0), t.get('docs', 0))} ({t.get('docs', 0)} документов с ПДн) |",
         f"| Чистые документы без изменений | {_pct(t.get('clean_docs', 0) - t.get('false_alarm', 0), t.get('clean_docs', 0))} ({t.get('clean_docs', 0)} документов без ПДн) |",
     ]
@@ -424,6 +500,7 @@ def pii_report(summary: dict, meta: dict) -> str:
     lines += [
         "",
         "Решения AIGate: " + ", ".join(f"{k} {v}" for k, v in sorted(summary["decisions"].items())),
+        "Ошибки и пропуски исключены из метрик качества; при их наличии код завершения — 1.",
         "",
     ]
     lines += [
@@ -523,11 +600,14 @@ def _tool_declaration(row: dict) -> dict | None:
 def classify_chat(gate: Gate, row: dict, model: str) -> dict:
     status, body, _ = gate.post("/v1/chat/completions", chat_body(row, model))
     code = _error_code(body)
+    message = _error_message(body)
     if status == 200:
         return {"decision": "allow", "reason": "forwarded", "status": status}
+    if INCOMPLETE_SCAN.search(message):
+        return {"decision": "error", "reason": "scan_incomplete", "status": status}
     if status == 403 and code in ("REQUEST_BLOCKED", "CONTENT_GUARD_BLOCKED"):
-        return {"decision": "block", "reason": code, "status": status}
-    if status == 422:
+        return {"decision": "block", "reason": code, "status": status, "message": message}
+    if status == 422 and _local_block(body):
         return {"decision": "block", "reason": "client_local_preflight_blocked", "status": status}
     if UPSTREAM_ERROR.search(_error_message(body)):
         # AIGate passed the request on; the model provider refused it for its own reasons.
@@ -549,6 +629,9 @@ def score_injection(rows: list[dict], outcomes: list[dict]) -> dict:
             "kind:" + str(row.get("kind") or "-"),
             "source:" + str(row["source"]),
         ]
+        for field in ("category", "difficulty", "policy_dependent"):
+            if field in row:
+                keys.append(field + ":" + str(row[field]))
         for key in keys:
             group = groups[key]
             if decision == "error":
@@ -558,7 +641,7 @@ def score_injection(rows: list[dict], outcomes: list[dict]) -> dict:
             group[
                 ("tp" if flagged else "fn") if label == "malicious" else ("fp" if flagged else "tn")
             ] += 1
-        details.append({"id": row["id"], "source": row["source"], "label": label, **outcome})
+        details.append({**_row_metadata(row), "label": label, **outcome})
     return {
         "groups": {k: dict(v) for k, v in groups.items()},
         "decisions": dict(decisions),
@@ -572,7 +655,8 @@ def injection_report(summary: dict, meta: dict) -> str:
         "",
         _meta_lines(meta),
         "",
-        "Атака обнаружена, если AIGate заблокировал строку. Ложное срабатывание — блокировка безобидной строки.",
+        "Атака обнаружена при блокировке или вырезании инъекции. Ложное срабатывание — такое же решение по безобидной строке.",
+        "Ошибки API исключены из TP/FN/FP/TN; при их наличии код завершения — 1.",
         "",
         "| Срез | Атак | Обнаружено | Безобидных | Ложные срабатывания | Точность | Ошибки |",
         "|---|---:|---:|---:|---:|---:|---:|",
@@ -652,7 +736,11 @@ def load_settings(path: Path) -> Settings:
     settings.insecure = flag("aigate", "insecure", False)
     settings.timeout = number("aigate", "timeout", 60)
     settings.retries = int(number("aigate", "retries", 8))
-    settings.jobs = int(number("aigate", "jobs", 4))
+    settings.jobs = int(number("aigate", "jobs", 1))
+    if not math.isfinite(settings.timeout) or settings.timeout <= 0:
+        raise SystemExit("[aigate] timeout must be positive and finite")
+    if settings.jobs < 1 or settings.retries < 0:
+        raise SystemExit("[aigate] jobs must be >= 1 and retries >= 0")
     settings.header = (
         [f"{name}: {value}" for name, value in parser.items("headers")]
         if parser.has_section("headers")
@@ -681,6 +769,42 @@ def dataset_files(folder: Path, only: list[str] | None) -> list[str]:
     return files
 
 
+def cmd_datasets(settings: Settings, args: argparse.Namespace) -> int:
+    """Validate and inventory data offline, before credentials or HTTP are needed."""
+    inventory = []
+    for name in ("pii", "injection"):
+        folder = getattr(settings, name + "_folder")
+        files = dataset_files(folder, args.only)
+        rows = load_rows(files, args.limit)
+        if not rows:
+            raise SystemExit(f"{folder}: dataset has no rows")
+        for row in rows:
+            if not row["text"].strip():
+                raise SystemExit(f"row {row['id']}: empty text")
+            if name == "pii":
+                check_entities(row)
+            else:
+                row_label(row)
+                if row.get("kind", "tool_result") not in {"tool_result", "tool_description", "user_prompt"}:
+                    raise SystemExit(f"row {row['id']}: unsupported injection kind")
+        item = {
+            "suite": name, "rows": len(rows), "files": len(files),
+            "languages": dict(collections.Counter(r.get("language", "-") for r in rows)),
+            "categories": dict(collections.Counter(r.get("category", "example") for r in rows)),
+            "sha256": {str(Path(f).relative_to(folder)): hashlib.sha256(Path(f).read_bytes()).hexdigest() for f in files},
+        }
+        if name == "pii":
+            item["entity_types"] = dict(collections.Counter(
+                e["type"] for r in rows for e in (check_entities(r) or [])
+            ))
+            item["clean"] = sum(r.get("entities") == [] for r in rows)
+        else:
+            item["labels"] = dict(collections.Counter(row_label(r) for r in rows))
+        inventory.append(item)
+    print(json.dumps({"tool": VERSION, "datasets": inventory}, ensure_ascii=False, indent=2))
+    return 0
+
+
 # --------------------------------------------------------------------------- commands
 
 
@@ -702,6 +826,7 @@ def _meta_lines(meta: dict) -> str:
 
 def _write(out: Path, name: str, report: str, summary: dict, meta: dict) -> None:
     out.mkdir(parents=True, exist_ok=True)
+    summary = dict(summary)
     details = summary.pop("details")
     (out / f"{name}.md").write_text(report, encoding="utf-8")
     (out / f"{name}.json").write_text(
@@ -714,13 +839,19 @@ def _write(out: Path, name: str, report: str, summary: dict, meta: dict) -> None
     print(f"Отчёт: {out / (name + '.md')}, построчно: {out / (name + '.raw.jsonl')}", file=sys.stderr)
 
 
-def _meta(gate: Gate, path: str, rows: int, files: list[str]) -> dict:
+def _dataset_sha256(files: list[str]) -> dict:
+    common = Path(os.path.commonpath([str(Path(f).resolve().parent) for f in files]))
+    return {Path(f).resolve().relative_to(common).as_posix(): hashlib.sha256(Path(f).read_bytes()).hexdigest() for f in files}
+
+
+def _meta(gate: Gate, path: str, rows: int, files: list[str], snapshot: dict | None = None) -> dict:
     return {
         "tool": f"aigate-eval {VERSION}",
         "url": gate.base,
         "path": path,
         "rows": rows,
         "files": [Path(f).name for f in files],
+        "dataset_sha256": snapshot if snapshot is not None else _dataset_sha256(files),
         "finished": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "throttled": gate.throttled,
     }
@@ -746,20 +877,28 @@ def cmd_check(settings: Settings, args: argparse.Namespace) -> int:
     if attack["decision"] != "block" and not (
         attack["decision"] == "mask" and INJECTION_MARK in (attack.get("text") or "")
     ):
+        if settings.via != "chat":
+            ok = False
         print("   Не заблокировано. Для [injection] via = preflight нужна политика из README.html.")
-    if settings.model:
+    if settings.via == "chat" and settings.model:
         row = {"id": "check-chat", "text": INJECTION_SAMPLE, "kind": "tool_result"}
         result = classify_chat(gate, row, settings.model)
         print(
             f"\n3. Инъекция в ответе инструмента (/v1/chat/completions): "
             f"decision={result['decision']} reason={result.get('reason')}"
         )
+        if settings.via == "chat" and result["decision"] != "block":
+            ok = False
+    elif settings.via == "chat":
+        print("   Для проверки chat укажите [injection] model.")
+        ok = False
     return 0 if ok else 1
 
 
 def cmd_pii(settings: Settings, args: argparse.Namespace) -> int:
     gate = Gate(settings)
     files = dataset_files(settings.pii_folder, args.only)
+    snapshot = _dataset_sha256(files)
     rows = load_rows(files, args.limit)
     partial = partially_labeled(settings.pii_folder)
     for row in rows:
@@ -775,9 +914,10 @@ def cmd_pii(settings: Settings, args: argparse.Namespace) -> int:
 
     outcomes = run_parallel(rows, work, settings.jobs, "pii")
     summary = score_pii(rows, outcomes)
-    meta = _meta(gate, "/v1/preflight", len(rows), files)
+    meta = _meta(gate, "/v1/preflight", len(rows), files, snapshot)
+    meta["limit_per_file"] = args.limit
     _write(Path(settings.out), "pii", pii_report(summary, meta), summary, meta)
-    return 0
+    return 1 if any(o.get("decision") in ("error", "skipped") for o in outcomes) else 0
 
 
 def cmd_injection(settings: Settings, args: argparse.Namespace) -> int:
@@ -785,6 +925,7 @@ def cmd_injection(settings: Settings, args: argparse.Namespace) -> int:
     if settings.via == "chat" and not settings.model:
         raise SystemExit("[injection] via = chat требует model: модель, разрешённую интеграции")
     files = dataset_files(settings.injection_folder, args.only)
+    snapshot = _dataset_sha256(files)
     rows = load_rows(files, args.limit)
     for row in rows:
         row["_label"] = row_label(row)
@@ -801,7 +942,7 @@ def cmd_injection(settings: Settings, args: argparse.Namespace) -> int:
             return {"decision": "error", "reason": "text_over_128_kib"}
         outcome = gate.preflight(row["text"], row["id"])
         # A policy with injection_mode: masking cuts the attack out instead of blocking.
-        if outcome["decision"] == "mask" and INJECTION_MARK in (outcome.get("text") or ""):
+        if outcome["decision"] == "mask" and (outcome.get("text") or "").count(INJECTION_MARK) > row["text"].count(INJECTION_MARK):
             outcome = {**outcome, "decision": "block", "reason": "injection_masked"}
         outcome.pop("text", None)
         return outcome
@@ -809,9 +950,10 @@ def cmd_injection(settings: Settings, args: argparse.Namespace) -> int:
     outcomes = run_parallel(rows, work, settings.jobs, "injection")
     summary = score_injection(rows, outcomes)
     path = "/v1/chat/completions" if settings.via == "chat" else "/v1/preflight"
-    meta = _meta(gate, path, len(rows), files)
+    meta = _meta(gate, path, len(rows), files, snapshot)
+    meta.update({"limit_per_file": args.limit, "via": settings.via, "model": settings.model if settings.via == "chat" else None})
     _write(Path(settings.out), "injection", injection_report(summary, meta), summary, meta)
-    return 0
+    return 1 if any(o.get("decision") in ("error", "skipped") for o in outcomes) else 0
 
 
 def cmd_all(settings: Settings, args: argparse.Namespace) -> int:
@@ -827,12 +969,25 @@ def cmd_all(settings: Settings, args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Проверка AIGate на размеченных наборах")
-    parser.add_argument("command", nargs="?", default="all", choices=("all", "check", "pii", "injection"))
+    parser.add_argument("command", nargs="?", default="all", choices=("all", "check", "pii", "injection", "datasets"))
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="файл настроек (по умолчанию config.ini)")
-    parser.add_argument("--limit", type=int, help="взять только первые N строк")
+    parser.add_argument("--limit", type=int, help="взять только первые N строк из каждого файла")
     parser.add_argument("--only", action="append", help="только набор с этим именем файла (можно несколько)")
     parser.add_argument("--version", action="version", version=f"aigate-eval {VERSION}")
     args = parser.parse_args(argv)
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit must be positive")
+    if args.command == "datasets":
+        # Paths in a provided config still work; no configured URL or token is required.
+        config = configparser.ConfigParser(interpolation=None)
+        if args.config.is_file():
+            config.read(args.config, encoding="utf-8")
+        base = args.config.resolve().parent
+        offline = Settings()
+        for name in ("pii", "injection"):
+            path = Path(os.path.expanduser(config.get(name, "folder", fallback=f"benchmarks/{name}")))
+            setattr(offline, name + "_folder", path if path.is_absolute() else base / path)
+        return cmd_datasets(offline, args)
     settings = load_settings(args.config)
     command = {"all": cmd_all, "check": cmd_check, "pii": cmd_pii, "injection": cmd_injection}
     return command[args.command](settings, args)
